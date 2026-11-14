@@ -1,0 +1,39 @@
+{
+  "name": "timp-sdd-backend",
+  "version": "1.0.0",
+  "description": "Backend API para la PWA de reservas de clases de cerámica (Timp SDD)",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "typegen": "openapi-typescript ../specs/openapi.yaml -o src/types/api.d.ts",
+    "build": "tsc",
+    "dev": "tsx watch src/server.ts",
+    "start": "node dist/server.js",
+    "test": "tsx --test test/**/*.test.ts"
+  },
+  "keywords": [
+    "timp",
+    "sdd",
+    "fastify",
+    "typescript",
+    "ceramics"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@fastify/cookie": "^11.1.5",
+    "@fastify/cors": "^11.4.2",
+    "@fastify/jwt": "^10.2.7",
+    "argon2": "^0.45.2",
+    "fastify": "^5.12.8",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/pg": "^8.23.1",
+    "openapi-typescript": "^7.13.0",
+    "pg-mem": "^3.0.14",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  }
+}

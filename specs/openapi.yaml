@@ -1,0 +1,1453 @@
+openapi: 3.1.0
+info:
+  title: Timp SDD - API de Reservas para Taller de Cerámica
+  version: 1.0.0
+  description: |
+    API REST para la PWA de reservas de clases del estudio de cerámica (Torno Alfarero, Modelado Manual y Monográficos).
+    
+    ### Principios de Arquitectura y Seguridad
+    - **Especificación estricta (SDD)**: Alineada con [AGENT_RULES.md](file:///home/vruiz-ru/Desktop/Proyectos%20CLI/timp-sdd/specs/AGENT_RULES.md) y [schema.sql](file:///home/vruiz-ru/Desktop/Proyectos%20CLI/timp-sdd/specs/schema.sql).
+    - **Zero Trust (Regla 5)**: Sesiones autenticadas exclusivamente mediante cookies `HttpOnly`, `Secure` y `SameSite=Strict`. Prohibido el uso de `localStorage`.
+    - **Concurrencia (Regla 3)**: Reservas gestionadas mediante transacciones SQL con bloqueo pesimista (`SELECT ... FOR UPDATE`), garantizando físicamente la prevención de overbooking y saldos negativos.
+    - **RBAC en Servidor (Regla 5.4)**: `user_id` y `role` se extraen siempre del token validado en backend. Endpoints críticos protegidos con Rate Limiting.
+
+servers:
+  - url: /
+    description: Servidor API local / producción
+
+paths:
+  # ============================================================================
+  # AUTENTICACIÓN Y SESIONES (Regla 5.2)
+  # ============================================================================
+  /auth/login:
+    post:
+      summary: Iniciar sesión
+      description: |
+        Autentica al usuario validando sus credenciales contra el hash Argon2id (Regla 5.1).
+        En caso de éxito, genera un Access Token (JWT, vida útil 15 min) y un Refresh Token rotatorio persistido en base de datos.
+        Ambos tokens se inyectan **exclusivamente** mediante cookies `Set-Cookie` seguras (`HttpOnly`, `Secure`, `SameSite=Strict`).
+        Endpoint protegido con Rate Limiting contra ataques de fuerza bruta.
+      operationId: login
+      tags:
+        - Autenticación
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Autenticación exitosa. Cookies de sesión emitidas en los encabezados HTTP.
+          headers:
+            Set-Cookie:
+              description: |
+                Contiene las directivas para establecer:
+                - `access_token=<jwt>; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=900`
+                - `refresh_token=<token_opaco>; Path=/auth; HttpOnly; Secure; SameSite=Strict; Max-Age=2592000`
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSuccessResponse'
+        '400':
+          description: Formato de petición inválido (campos faltantes o tipos incorrectos).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Credenciales incorrectas o usuario inactivo (`is_active = false`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '429':
+          description: Rate limit superado. Demasiados intentos fallidos de login.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /auth/refresh:
+    post:
+      summary: Rotar sesión (Refresh Token)
+      description: |
+        Lee la cookie segura `refresh_token`, busca el registro en `refresh_tokens` verificando que no esté expirado ni revocado (`revoked_at IS NULL`).
+        
+        **Detección de Reutilización (Regla 5.2)**:
+        Si el token presentado ya fue revocado, se asume robo de sesión y se invalidan **todos** los tokens del usuario.
+        
+        Si el token es válido:
+        1. Se revoca atómicamente el token actual (`revoked_at = now()`).
+        2. Se emite e inserta un nuevo refresh token en base de datos.
+        3. Se genera un nuevo Access Token JWT (15 min).
+        4. Se retornan las nuevas cookies en los headers `Set-Cookie`.
+      operationId: refreshToken
+      tags:
+        - Autenticación
+      security:
+        - CookieRefreshToken: []
+      responses:
+        '200':
+          description: Sesión renovada exitosamente. Nuevas cookies `Set-Cookie` inyectadas.
+          headers:
+            Set-Cookie:
+              description: Nuevos `access_token` y `refresh_token` rotados.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshSuccessResponse'
+        '401':
+          description: Refresh token ausente, expirado, inválido o reutilizado (sesión terminada).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # ============================================================================
+  # ACTIVIDADES (Regla 5)
+  # ============================================================================
+  /api/v1/activity-types:
+    get:
+      summary: Listar tipos de actividad
+      description: |
+        Devuelve el listado de tipos de actividad activos (`is_active = true`) para poblar selectores de clases y formularios.
+        Protegido mediante cookie de sesión segura `access_token` (Regla 5.2).
+      operationId: getActivityTypes
+      tags:
+        - Actividades
+      security:
+        - CookieAccessToken: []
+      responses:
+        '200':
+          description: Listado de tipos de actividad disponibles.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ActivityTypeInfo'
+        '401':
+          description: No autenticado. Cookie de sesión ausente o inválida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # ============================================================================
+  # SESIONES / CLASES DE CERÁMICA
+  # ============================================================================
+  /api/v1/sessions:
+    get:
+      summary: Consultar clases programadas en el calendario
+      description: |
+        Devuelve el listado de sesiones de cerámica (torno, modelado, monográficos) programadas entre las fechas `from` y `to`.
+        Combina la información operativa de `sessions` con los metadatos de `activity_types` y el nombre de la profesora ceramista (`trainer`).
+      operationId: getSessions
+      tags:
+        - Sesiones
+      parameters:
+        - name: from
+          in: query
+          required: true
+          description: Fecha/hora de inicio del rango de búsqueda en formato ISO 8601 (inclusive).
+          schema:
+            type: string
+            format: date-time
+          example: '2026-11-14T08:00:00Z'
+        - name: to
+          in: query
+          required: true
+          description: Fecha/hora fin del rango de búsqueda en formato ISO 8601 (inclusive).
+          schema:
+            type: string
+            format: date-time
+          example: '2026-11-14T22:00:00Z'
+        - name: activity_type_id
+          in: query
+          required: false
+          description: Filtro opcional por tipo de actividad concreta.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Listado de sesiones encontradas para el rango solicitado.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SessionDetailResponse'
+        '400':
+          description: Parámetros inválidos (ej. formato de fecha incorrecto o `from` posterior a `to`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    post:
+      summary: Crear una nueva sesión en el calendario
+      description: |
+        Crea una nueva clase programada en el calendario del taller (Regla 5.4).
+        
+        **Control de Acceso (RBAC)**:
+        - Permitido para roles `admin` y `trainer`.
+        - Si un usuario con rol `client` intenta crear una sesión, se rechaza con `403 Forbidden`.
+        
+        **Lógica de negocio**:
+        - Recibe `activityTypeId`, `startsAt`, `endsAt`, `maxCapacity` y opcionalmente `trainerId`.
+        - Inicializa automáticamente `available_slots = maxCapacity`.
+        - Si el creador tiene rol `trainer`, se asigna su propio `user_id` como `trainer_id`. Si es `admin`, puede asignar a otra profesora mediante `trainerId` o por defecto a sí mismo.
+      operationId: createSession
+      tags:
+        - Sesiones
+      security:
+        - CookieAccessToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionRequest'
+      responses:
+        '201':
+          description: Sesión creada exitosamente en el calendario.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionDetailResponse'
+        '400':
+          description: Parámetros inválidos (fechas inconsistentes, tipo de actividad inexistente o capacidad incorrecta).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: No autenticado. Cookie de sesión no válida o ausente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Prohibido. Rol no autorizado (los usuarios 'client' no pueden crear sesiones).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                forbiddenClient:
+                  summary: Cliente no autorizado
+                  value:
+                    error:
+                      code: FORBIDDEN
+                      message: "No tienes permisos para crear sesiones. Se requiere rol 'admin' o 'trainer'."
+
+  /api/v1/sessions/{id}/attendees:
+    get:
+      summary: Listar asistentes confirmados a una sesión
+      description: |
+        Devuelve el listado de alumnos con reserva confirmada (`status = 'confirmed'`) para una sesión específica del calendario.
+        
+        **Control de Acceso (RBAC - Regla 5.4)**:
+        - Permitido exclusivamente para roles `admin` y `trainer`.
+        - Si un usuario con rol `client` intenta acceder, se rechaza con `403 Forbidden`.
+      operationId: getSessionAttendees
+      tags:
+        - Sesiones
+      security:
+        - CookieAccessToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Identificador único UUID de la sesión a consultar.
+          schema:
+            type: string
+            format: uuid
+          example: e0000000-0000-0000-0000-000000000001
+      responses:
+        '200':
+          description: Lista de asistentes confirmados a la clase.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SessionAttendeeItem'
+        '400':
+          description: Parámetros inválidos (ej. `id` no es un UUID válido).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: No autenticado. Cookie de sesión no válida o ausente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Prohibido. Requiere rol 'admin' o 'trainer' (los clientes no pueden consultar listas de asistentes).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                forbiddenClient:
+                  summary: Cliente no autorizado
+                  value:
+                    error:
+                      code: FORBIDDEN
+                      message: "No tienes permisos para consultar la lista de asistentes. Se requiere rol 'admin' o 'trainer'."
+        '404':
+          description: Sesión no encontrada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                sessionNotFound:
+                  summary: Sesión inexistente
+                  value:
+                    error:
+                      code: SESSION_NOT_FOUND
+                      message: No se encontró ninguna sesión con el identificador indicado.
+
+  # ============================================================================
+  # RESERVAS DE CLASES (Regla 3 & Regla 5)
+  # ============================================================================
+  /api/v1/bookings:
+    post:
+      summary: Reservar una plaza en una clase
+      description: |
+        Reserva una plaza para el usuario autenticado en la sesión indicada por `sessionId`.
+        
+        **Flujo Transaccional Estricto (Regla 3)**:
+        1. La identidad del alumno (`user_id`) se extrae **exclusivamente del Access Token JWT** de la cookie (Regla 5.4).
+        2. Se inicia una transacción SQL con aislamiento estricto.
+        3. Se adquiere bloqueo pesimista `SELECT ... FOR UPDATE` sobre la sesión y el usuario.
+        4. Validaciones de negocio:
+           - ¿Hay plazas libres? (`available_slots > 0`)
+           - ¿El alumno tiene créditos suficientes? (`credits >= activity.credit_cost`)
+           - ¿Tiene ya una reserva confirmada? (garantizado además por el índice único parcial)
+        5. Se descuenta 1 plaza en `sessions` y los créditos correspondientes en `users`.
+        6. Se inserta el registro en `bookings` con estado `confirmed`.
+        7. `COMMIT` de la transacción.
+        
+        Endpoint con Rate Limiting para evitar spam y condiciones de carrera masivas.
+      operationId: createBooking
+      tags:
+        - Reservas
+      security:
+        - CookieAccessToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookingRequest'
+      responses:
+        '201':
+          description: Reserva confirmada exitosamente. Créditos descontados y plaza asignada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingConfirmedResponse'
+        '400':
+          description: Parámetros inválidos (ej. `sessionId` no es un UUID válido o body malformado).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: No autenticado. Cookie de sesión ausente, inválida o expirada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Créditos insuficientes en la cuenta del alumno para reservar esta clase.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                insufficientCredits:
+                  value:
+                    error:
+                      code: INSUFFICIENT_CREDITS
+                      message: "No dispones de créditos suficientes para reservar esta actividad (requeridos: 2, disponibles: 1)."
+        '409':
+          description: Conflicto. Clase completa sin plazas libres o reserva duplicada para la misma sesión.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                slotsExhausted:
+                  summary: Plazas agotadas
+                  value:
+                    error:
+                      code: SLOTS_EXHAUSTED
+                      message: La sesión seleccionada no tiene plazas disponibles.
+                duplicateBooking:
+                  summary: Doble reserva
+                  value:
+                    error:
+                      code: DUPLICATE_BOOKING
+                      message: Ya dispones de una reserva confirmada para esta sesión.
+        '429':
+          description: Rate limit excedido para operaciones de reserva.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/bookings/me:
+    get:
+      summary: Listar las reservas del usuario autenticado
+      description: |
+        Devuelve el historial completo de reservas (activas y canceladas) del usuario autenticado.
+        La identidad del usuario se extrae **exclusivamente del Access Token JWT** de la cookie (Regla 5.4).
+      operationId: getMyBookings
+      tags:
+        - Reservas
+      security:
+        - CookieAccessToken: []
+      responses:
+        '200':
+          description: Listado de reservas del usuario con información de la sesión y actividad vinculada.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/UserBookingItem'
+        '401':
+          description: No autenticado. Cookie de sesión no válida o ausente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/bookings/{id}:
+    delete:
+      summary: Cancelar una reserva
+      description: |
+        Cancela una reserva confirmada (`status = 'confirmed'`) perteneciente al usuario autenticado.
+        
+        **Flujo Transaccional Estricto y Reembolso (Regla 3 & Regla 5.4)**:
+        1. La identidad del usuario (`user_id`) se extrae **exclusivamente del Access Token JWT** de la cookie (Regla 5.4).
+        2. Se inicia una transacción SQL con aislamiento estricto (`BEGIN`).
+        3. Se bloquea la fila de la reserva (`SELECT ... FROM bookings WHERE id = $1 FOR UPDATE`).
+        4. Validaciones de negocio:
+           - La reserva debe existir y pertenecer al usuario autenticado (RBAC en servidor, 403 si pertenece a otro).
+           - La reserva debe estar en estado `confirmed` (400 si ya fue cancelada).
+        5. Se bloquea la sesión vinculada (`SELECT ... FOR UPDATE OF s`) y el usuario (`SELECT ... FOR UPDATE`).
+        6. Se actualiza la reserva marcando `status = 'cancelled'` y `cancelled_at = now()`.
+        7. **Devolución de créditos**: Se reintegra el coste cobrado (`credits_charged`) directamente al saldo del usuario (`credits = credits + credits_charged`).
+        8. **Liberación de plaza**: Se incrementa en 1 la plaza disponible en `sessions` (`available_slots = available_slots + 1`), garantizado por `CHECK (available_slots <= max_capacity)`.
+        9. `COMMIT` de la transacción.
+      operationId: cancelBooking
+      tags:
+        - Reservas
+      security:
+        - CookieAccessToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Identificador único UUID de la reserva a cancelar.
+          schema:
+            type: string
+            format: uuid
+          example: f0000000-0000-0000-0000-000000000001
+      responses:
+        '200':
+          description: Reserva cancelada exitosamente. Créditos reembolsados al usuario y plaza liberada en la sesión.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelBookingResponse'
+        '400':
+          description: Parámetros inválidos o la reserva ya fue cancelada con anterioridad.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                alreadyCancelled:
+                  summary: Ya cancelada
+                  value:
+                    error:
+                      code: BOOKING_ALREADY_CANCELLED
+                      message: La reserva seleccionada ya fue cancelada previamente.
+        '401':
+          description: No autenticado. Cookie de sesión no válida o ausente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Prohibido. La reserva pertenece a otro usuario (violación de RBAC).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                forbidden:
+                  summary: Acceso no autorizado a reserva ajena
+                  value:
+                    error:
+                      code: FORBIDDEN
+                      message: No tienes autorización para cancelar una reserva que pertenece a otro usuario.
+        '404':
+          description: Reserva no encontrada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                notFound:
+                  summary: Reserva inexistente
+                  value:
+                    error:
+                      code: BOOKING_NOT_FOUND
+                      message: No se encontró ninguna reserva con el identificador indicado.
+
+  # ============================================================================
+  # GESTIÓN DE USUARIOS Y BONOS (ADMIN - Regla 5.4)
+  # ============================================================================
+  /api/v1/users/clients:
+    get:
+      summary: Listar alumnos del taller
+      description: |
+        Devuelve el listado de alumnos registrados con rol `client` (`id`, `fullName`, `email`, `credits`) para la administración de bonos.
+        
+        **Control de Acceso (RBAC)**:
+        - Requiere estrictamente rol `admin` (Regla 5.4).
+        - Si un usuario con rol `trainer` o `client` intenta acceder, se rechaza con `403 Forbidden`.
+      operationId: getClients
+      tags:
+        - Usuarios
+      security:
+        - CookieAccessToken: []
+      responses:
+        '200':
+          description: Listado de alumnos registrado en el sistema.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ClientUserItem'
+        '401':
+          description: No autenticado. Cookie de sesión ausente o inválida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Prohibido. Requiere rol 'admin'.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                forbiddenRole:
+                  summary: Rol no administrador
+                  value:
+                    error:
+                      code: FORBIDDEN
+                      message: "Acceso restringido. Se requiere rol 'admin'."
+
+  /api/v1/users/{id}/credits:
+    post:
+      summary: Sumar créditos al saldo de un alumno
+      description: |
+        Suma créditos al saldo de un alumno mediante una transacción SQL atómica con bloqueo de fila pesimista (Regla 3 & Regla 5.4).
+        
+        **Control de Acceso (RBAC)**:
+        - Requiere estrictamente rol `admin` (Regla 5.4).
+        - Si un usuario con rol `trainer` o `client` intenta acceder, se rechaza con `403 Forbidden`.
+        
+        **Lógica de negocio**:
+        - Recibe un valor `delta` entero positivo en el body (`delta > 0`).
+        - Ejecuta una transacción SQL (`BEGIN ... SELECT ... FOR UPDATE ... UPDATE users SET credits = credits + $1 ... COMMIT`).
+        - Devuelve el nuevo saldo actualizado del alumno.
+      operationId: addCreditsToUser
+      tags:
+        - Usuarios
+      security:
+        - CookieAccessToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Identificador único UUID del alumno al que se sumarán créditos.
+          schema:
+            type: string
+            format: uuid
+          example: c0000000-0000-0000-0000-000000000001
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddCreditsRequest'
+      responses:
+        '200':
+          description: Créditos añadidos correctamente. Devuelve el nuevo saldo del alumno.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserCreditsUpdatedResponse'
+        '400':
+          description: Parámetros inválidos (delta menor o igual a 0 o el usuario no es un alumno).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: No autenticado. Cookie de sesión ausente o inválida.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Prohibido. Requiere rol 'admin'.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Alumno no encontrado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                userNotFound:
+                  summary: Alumno no encontrado
+                  value:
+                    error:
+                      code: USER_NOT_FOUND
+                      message: No se encontró ningún alumno con el identificador indicado.
+
+  # ============================================================================
+  # CATÁLOGO DE PIEZAS DE CERÁMICA / ARTWORKS (Beatriz Tabliega)
+  # ============================================================================
+  /api/v1/artworks:
+    get:
+      summary: Listar piezas del catálogo cerámico
+      description: |
+        Devuelve el catálogo de piezas cerámicas únicas y de autor (`is_active = true`) creadas en el taller por Beatriz Tabliega.
+        Endpoint público sin autenticación requerida.
+      operationId: getArtworks
+      tags:
+        - Catálogo de Piezas
+      security: []
+      responses:
+        '200':
+          description: Listado de piezas cerámicas disponibles en el catálogo.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ArtworkResponse'
+        '400':
+          description: Parámetros inválidos.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    post:
+      summary: Añadir una nueva pieza o lote al catálogo cerámico
+      description: |
+        Permite a la maestra ceramista (Beatriz Tabliega) o a administración registrar nuevas piezas salidas del horno o dar de alta stock (Regla 5.4).
+        
+        **Control de Acceso (RBAC)**:
+        - Permitido para roles `admin` y `trainer`.
+        - Si un usuario con rol `client` intenta crear o añadir una pieza, se rechaza con `403 Forbidden`.
+      operationId: createArtwork
+      tags:
+        - Catálogo de Piezas
+      security:
+        - CookieAccessToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateArtworkRequest'
+      responses:
+        '201':
+          description: Pieza registrada exitosamente en el catálogo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ArtworkResponse'
+        '400':
+          description: Parámetros inválidos (ej. precio <= 0 o stock < 0).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: No autenticado. Cookie de sesión no válida o ausente.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Prohibido. Requiere rol 'admin' o 'trainer'.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                forbiddenClient:
+                  summary: Cliente no autorizado
+                  value:
+                    error:
+                      code: FORBIDDEN
+                      message: "No tienes permisos para añadir piezas al catálogo. Se requiere rol 'admin' o 'trainer'."
+
+  /api/v1/artworks/{id}:
+    delete:
+      summary: Retirar una pieza del catálogo cerámico
+      description: |
+        Permite a la maestra ceramista o administración retirar una pieza del catálogo de venta (Regla 5.4).
+        
+        **Control de Acceso (RBAC)**:
+        - Requiere rol `admin` o `trainer`.
+        - Clientes reciben `403 Forbidden`.
+      operationId: deleteArtwork
+      tags:
+        - Catálogo de Piezas
+      security:
+        - CookieAccessToken: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Identificador único UUID de la pieza a retirar.
+          schema:
+            type: string
+            format: uuid
+          example: f1000000-0000-0000-0000-000000000001
+      responses:
+        '200':
+          description: Pieza retirada exitosamente del catálogo.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteArtworkResponse'
+        '401':
+          description: No autenticado.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Prohibido. Requiere rol 'admin' o 'trainer'.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Pieza no encontrada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/artworks/{id}/buy:
+    post:
+      summary: Comprar una pieza cerámica única
+      description: |
+        Ejecuta la compra de una pieza del catálogo cerámico mediante una transacción SQL atómica con bloqueo pesimista (Regla 3).
+        
+        **Lógica transaccional y concurrencia**:
+        1. Inicia una transacción SQL (`BEGIN`).
+        2. Bloquea la fila de la pieza (`SELECT id, title, price_eur, stock FROM artworks WHERE id = $1 FOR UPDATE`).
+        3. Valida disponibilidad (`stock > 0`). Si `stock === 0`, hace `ROLLBACK` y responde con `409 Conflict (STOCK_EXHAUSTED)`.
+        4. Decrementa el stock en 1 (`UPDATE artworks SET stock = stock - 1 WHERE id = $1`), garantizado por `CHECK (stock >= 0)`.
+        5. Consolida la transacción (`COMMIT`).
+        6. Devuelve confirmación con código de referencia de pedido (`orderRef`) y stock restante.
+        
+        Accesible de forma pública (para compras directas) o autenticada.
+      operationId: buyArtwork
+      tags:
+        - Catálogo de Piezas
+      security: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Identificador único UUID de la pieza cerámica a comprar.
+          schema:
+            type: string
+            format: uuid
+          example: f1000000-0000-0000-0000-000000000001
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BuyArtworkRequest'
+      responses:
+        '200':
+          description: Compra confirmada exitosamente. Stock descontado y referencia de pedido generada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BuyArtworkResponse'
+        '400':
+          description: Parámetros inválidos (ej. ID no es un UUID o datos de comprador incompletos).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Pieza cerámica no encontrada.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                notFound:
+                  summary: Pieza inexistente
+                  value:
+                    error:
+                      code: ARTWORK_NOT_FOUND
+                      message: No se encontró la pieza cerámica con el identificador especificado.
+        '409':
+          description: Conflicto. La pieza está agotada (stock = 0).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                stockExhausted:
+                  summary: Stock agotado
+                  value:
+                    error:
+                      code: STOCK_EXHAUSTED
+                      message: La pieza seleccionada ya no tiene stock disponible (pieza única vendida).
+
+# ==============================================================================
+# COMPONENTES Y ESQUEMAS
+# ==============================================================================
+components:
+  securitySchemes:
+    CookieAccessToken:
+      type: apiKey
+      in: cookie
+      name: access_token
+      description: JWT de acceso de corta duración (15 min), transportado exclusivamente en cookie HttpOnly.
+    CookieRefreshToken:
+      type: apiKey
+      in: cookie
+      name: refresh_token
+      description: Token opaco rotatorio para renovación de sesión, transportado en cookie HttpOnly.
+
+  schemas:
+    # --- Autenticación ---
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+          description: Correo electrónico del usuario (se evalúa en minúsculas en backend).
+          example: sofia.alumna@example.com
+        password:
+          type: string
+          format: password
+          minLength: 8
+          description: Contraseña en texto claro enviada mediante HTTPS (se valida contra hash Argon2id).
+          example: CeramicaSegura2026!
+
+    UserProfile:
+      type: object
+      required:
+        - id
+        - email
+        - fullName
+        - role
+        - credits
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: c0000000-0000-0000-0000-000000000001
+        email:
+          type: string
+          format: email
+          example: sofia.alumna@example.com
+        fullName:
+          type: string
+          example: Sofía Valero
+        role:
+          type: string
+          enum: [client, trainer, admin]
+          example: client
+        credits:
+          type: integer
+          minimum: 0
+          example: 4
+
+    AuthSuccessResponse:
+      type: object
+      required:
+        - user
+        - message
+      properties:
+        message:
+          type: string
+          example: Sesión iniciada correctamente
+        user:
+          $ref: '#/components/schemas/UserProfile'
+
+    RefreshSuccessResponse:
+      type: object
+      required:
+        - message
+      properties:
+        message:
+          type: string
+          example: Sesión renovada con éxito
+
+    # --- Sesiones y Calendario ---
+    ActivityTypeInfo:
+      type: object
+      required:
+        - id
+        - name
+        - durationMinutes
+        - creditCost
+        - color
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: d0000000-0000-0000-0000-000000000001
+        name:
+          type: string
+          example: Torno Alfarero
+        description:
+          type:
+            - string
+            - 'null'
+          example: Iniciación y perfeccionamiento en el torno cerámico.
+        durationMinutes:
+          type: integer
+          minimum: 1
+          example: 120
+        creditCost:
+          type: integer
+          minimum: 1
+          example: 1
+        color:
+          type: string
+          pattern: '^#[0-9A-Fa-f]{6}$'
+          example: '#C17A56'
+
+    TrainerInfo:
+      type: object
+      required:
+        - id
+        - fullName
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: b0000000-0000-0000-0000-000000000001
+        fullName:
+          type: string
+          example: Carmen Martínez (Maestra Ceramista)
+
+    SessionDetailResponse:
+      type: object
+      required:
+        - id
+        - startsAt
+        - endsAt
+        - maxCapacity
+        - availableSlots
+        - activityType
+        - trainer
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: e0000000-0000-0000-0000-000000000001
+        startsAt:
+          type: string
+          format: date-time
+          example: '2026-11-14T10:00:00Z'
+        endsAt:
+          type: string
+          format: date-time
+          example: '2026-11-14T12:00:00Z'
+        maxCapacity:
+          type: integer
+          minimum: 1
+          description: Capacidad total de la clase (puestos físicos, ej. tornos).
+          example: 6
+        availableSlots:
+          type: integer
+          minimum: 0
+          description: Plazas libres actualmente para reservar.
+          example: 1
+        activityType:
+          $ref: '#/components/schemas/ActivityTypeInfo'
+        trainer:
+          $ref: '#/components/schemas/TrainerInfo'
+
+    CreateSessionRequest:
+      type: object
+      required:
+        - activityTypeId
+        - startsAt
+        - endsAt
+        - maxCapacity
+      properties:
+        activityTypeId:
+          type: string
+          format: uuid
+          description: Identificador único del tipo de actividad para la clase.
+          example: d0000000-0000-0000-0000-000000000001
+        startsAt:
+          type: string
+          format: date-time
+          description: Fecha y hora de inicio de la clase en formato ISO 8601.
+          example: '2026-11-20T10:00:00Z'
+        endsAt:
+          type: string
+          format: date-time
+          description: Fecha y hora de finalización de la clase en formato ISO 8601.
+          example: '2026-11-20T12:00:00Z'
+        maxCapacity:
+          type: integer
+          minimum: 1
+          description: Capacidad máxima física de la sesión (puestos de torno o mesas).
+          example: 6
+        trainerId:
+          type: string
+          format: uuid
+          description: Identificador opcional de la profesora responsable (solo permitido para rol admin).
+          example: b0000000-0000-0000-0000-000000000001
+
+    SessionAttendeeItem:
+      type: object
+      required:
+        - bookingId
+        - userId
+        - fullName
+        - email
+        - bookedAt
+      properties:
+        bookingId:
+          type: string
+          format: uuid
+          description: Identificador único de la reserva confirmada.
+          example: f0000000-0000-0000-0000-000000000001
+        userId:
+          type: string
+          format: uuid
+          description: Identificador único del alumno asistente.
+          example: c0000000-0000-0000-0000-000000000001
+        fullName:
+          type: string
+          description: Nombre completo del alumno.
+          example: Sofía Valero
+        email:
+          type: string
+          format: email
+          description: Correo electrónico de contacto del alumno.
+          example: sofia.alumna@example.com
+        bookedAt:
+          type: string
+          format: date-time
+          description: Fecha y hora en la que se confirmó la reserva.
+          example: '2026-11-13T02:20:00Z'
+
+    # --- Reservas ---
+    CreateBookingRequest:
+      type: object
+      required:
+        - sessionId
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+          description: Identificador único de la sesión programada que se desea reservar.
+          example: e0000000-0000-0000-0000-000000000001
+
+    BookingConfirmedResponse:
+      type: object
+      required:
+        - id
+        - sessionId
+        - status
+        - creditsCharged
+        - remainingCredits
+        - createdAt
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: f0000000-0000-0000-0000-000000000001
+        sessionId:
+          type: string
+          format: uuid
+          example: e0000000-0000-0000-0000-000000000001
+        status:
+          type: string
+          enum: [confirmed]
+          example: confirmed
+        creditsCharged:
+          type: integer
+          minimum: 1
+          description: Número de créditos deducidos para esta reserva.
+          example: 1
+        remainingCredits:
+          type: integer
+          minimum: 0
+          description: Saldo de créditos resultante del alumno tras la reserva.
+          example: 3
+        createdAt:
+          type: string
+          format: date-time
+          example: '2026-11-13T02:20:00Z'
+
+    UserBookingItem:
+      type: object
+      required:
+        - id
+        - sessionId
+        - status
+        - creditsCharged
+        - createdAt
+        - cancelledAt
+        - session
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: f0000000-0000-0000-0000-000000000001
+        sessionId:
+          type: string
+          format: uuid
+          example: e0000000-0000-0000-0000-000000000001
+        status:
+          type: string
+          enum: [confirmed, cancelled]
+          example: confirmed
+        creditsCharged:
+          type: integer
+          minimum: 1
+          description: Número de créditos deducidos al crear la reserva (devueltos al cancelar).
+          example: 1
+        createdAt:
+          type: string
+          format: date-time
+          example: '2026-11-13T02:20:00Z'
+        cancelledAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          example: null
+        session:
+          $ref: '#/components/schemas/SessionDetailResponse'
+
+    CancelBookingResponse:
+      type: object
+      required:
+        - message
+        - bookingId
+        - creditsRefunded
+        - newCreditBalance
+        - cancelledAt
+      properties:
+        message:
+          type: string
+          example: Reserva cancelada correctamente. Créditos reembolsados a tu saldo.
+        bookingId:
+          type: string
+          format: uuid
+          example: f0000000-0000-0000-0000-000000000001
+        creditsRefunded:
+          type: integer
+          minimum: 1
+          description: Número de créditos reembolsados al usuario.
+          example: 1
+        newCreditBalance:
+          type: integer
+          minimum: 0
+          description: Saldo actualizado de créditos del usuario tras el reembolso.
+          example: 4
+        cancelledAt:
+          type: string
+          format: date-time
+          example: '2026-11-13T03:30:00Z'
+
+    # --- Gestión de Usuarios y Créditos (Admin) ---
+    ClientUserItem:
+      type: object
+      required:
+        - id
+        - fullName
+        - email
+        - credits
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: c0000000-0000-0000-0000-000000000001
+        fullName:
+          type: string
+          example: Sofía Valero
+        email:
+          type: string
+          format: email
+          example: sofia.alumna@example.com
+        credits:
+          type: integer
+          minimum: 0
+          description: Saldo de créditos acumulados del alumno.
+          example: 4
+
+    AddCreditsRequest:
+      type: object
+      required:
+        - delta
+      properties:
+        delta:
+          type: integer
+          minimum: 1
+          description: Número de créditos a sumar al saldo del alumno (entero estrictamente positivo).
+          example: 4
+
+    UserCreditsUpdatedResponse:
+      type: object
+      required:
+        - id
+        - fullName
+        - credits
+        - message
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: c0000000-0000-0000-0000-000000000001
+        fullName:
+          type: string
+          example: Sofía Valero
+        credits:
+          type: integer
+          minimum: 0
+          description: Nuevo saldo actualizado de créditos del alumno.
+          example: 8
+        message:
+          type: string
+          example: Saldo de créditos actualizado exitosamente
+
+    # --- Catálogo de Piezas Cerámicas (Artworks) ---
+    ArtworkResponse:
+      type: object
+      required:
+        - id
+        - title
+        - category
+        - priceEur
+        - stock
+        - glazeFinish
+        - paletteHex
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: f1000000-0000-0000-0000-000000000001
+        title:
+          type: string
+          example: Jarra Asa Circular · Serie Klein
+        category:
+          type: string
+          example: Jarras
+        priceEur:
+          type: integer
+          minimum: 1
+          description: Precio de la pieza en euros (€).
+          example: 85
+        stock:
+          type: integer
+          minimum: 0
+          description: Unidades disponibles en stock (frecuentemente 1 para piezas únicas de torno/escultura).
+          example: 1
+        glazeFinish:
+          type: string
+          description: Descripción de los barros, engobes y vidriados utilizados.
+          example: Gres blanco con engobe sobre azul cobalto
+        paletteHex:
+          type: string
+          pattern: '^#[0-9A-Fa-f]{6}$'
+          description: Color característico representativo de la pieza en formato hex #RRGGBB.
+          example: '#2546A8'
+        imageUrl:
+          type: string
+          nullable: true
+          description: Ruta o URL de la fotografía de la pieza de autor.
+          example: /media/obras/jarras-klein.jpg
+
+    CreateArtworkRequest:
+      type: object
+      required:
+        - title
+        - category
+        - priceEur
+        - stock
+        - glazeFinish
+        - paletteHex
+      properties:
+        title:
+          type: string
+          minLength: 3
+          description: Título o nombre de la pieza de autor.
+          example: Jarra Asa Circular · Serie Klein
+        category:
+          type: string
+          description: Categoría de la pieza (ej. Jarras, Escultura, Vasijas, Menaje).
+          example: Jarras
+        priceEur:
+          type: integer
+          minimum: 1
+          description: Precio en euros (€).
+          example: 85
+        stock:
+          type: integer
+          minimum: 0
+          description: Unidades iniciales disponibles.
+          example: 1
+        glazeFinish:
+          type: string
+          description: Tipo de gres/arcilla, acabado y esmaltes aplicados.
+          example: Gres blanco con engobe sobre azul cobalto
+        paletteHex:
+          type: string
+          pattern: '^#[0-9A-Fa-f]{6}$'
+          description: Color hex representativo.
+          example: '#2546A8'
+        imageUrl:
+          type: string
+          nullable: true
+          description: Ruta o URL de la fotografía de la pieza de autor.
+          example: /media/obras/jarras-klein.jpg
+
+    BuyArtworkRequest:
+      type: object
+      required:
+        - buyerName
+        - buyerEmail
+      properties:
+        buyerName:
+          type: string
+          minLength: 2
+          description: Nombre completo de la persona compradora.
+          example: Sofía Valero
+        buyerEmail:
+          type: string
+          format: email
+          description: Correo electrónico para confirmación y envío de la pieza.
+          example: sofia.alumna@example.com
+
+    BuyArtworkResponse:
+      type: object
+      required:
+        - message
+        - orderRef
+        - artworkId
+        - title
+        - priceEur
+        - remainingStock
+      properties:
+        message:
+          type: string
+          example: Compra realizada exitosamente
+        orderRef:
+          type: string
+          description: Código único de referencia del pedido.
+          example: ORD-ART-20261113-Klein
+        artworkId:
+          type: string
+          format: uuid
+          example: f1000000-0000-0000-0000-000000000001
+        title:
+          type: string
+          example: Jarra Asa Circular · Serie Klein
+        priceEur:
+          type: integer
+          minimum: 1
+          example: 85
+        remainingStock:
+          type: integer
+          minimum: 0
+          description: Stock restante tras la compra.
+          example: 0
+
+    DeleteArtworkResponse:
+      type: object
+      required:
+        - message
+        - artworkId
+      properties:
+        message:
+          type: string
+          example: Pieza retirada del catálogo exitosamente
+        artworkId:
+          type: string
+          format: uuid
+          example: f1000000-0000-0000-0000-000000000001
+
+    # --- Errores ---
+    ErrorDetail:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: Código estandarizado de error de negocio o validación.
+          example: INVALID_INPUT
+        message:
+          type: string
+          description: Mensaje legible describiendo el error.
+          example: Los datos enviados no cumplen con el formato requerido.
+        details:
+          type:
+            - object
+            - array
+            - 'null'
+          description: Información granular sobre errores de validación por campo.
+
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          $ref: '#/components/schemas/ErrorDetail'
