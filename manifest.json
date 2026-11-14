@@ -1,0 +1,25 @@
+{
+  "name": "Beatriz Tabliega Studio",
+  "short_name": "Tabliega",
+  "description": "Estudio de cerámica de autor, diario visual y talleres · Madrid & Burgos",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#F5F2EB",
+  "theme_color": "#231F1E",
+  "icons": [
+    {
+      "src": "media/obras/jarras-klein.jpg",
+      "sizes": "192x192",
+      "type": "image/jpeg",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "media/obras/jarras-klein.jpg",
+      "sizes": "512x512",
+      "type": "image/jpeg",
+      "purpose": "any maskable"
+    }
+  ]
+}
